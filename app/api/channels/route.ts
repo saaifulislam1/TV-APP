@@ -56,21 +56,75 @@ type ChannelEntry = {
 };
 
 const API_ROOT = "https://iptv-org.github.io/api";
-const FEATURED_PER_COUNTRY = 30;
-const STREAM_CHECK_TIMEOUT_MS = 1800;
-const STREAM_CHECK_BATCH_SIZE = 8;
-const STREAMS_TO_CHECK_PER_CHANNEL = 3;
-const VERIFIED_COUNTRY = "IN";
-const CACHE_MS = 30 * 60 * 1000;
+const REVALIDATE_SECONDS = 30 * 60;
+const EUROPE_COUNTRY_CODES = [
+  "AL",
+  "AD",
+  "AT",
+  "BY",
+  "BE",
+  "BA",
+  "BG",
+  "HR",
+  "CY",
+  "CZ",
+  "DK",
+  "EE",
+  "FI",
+  "FR",
+  "DE",
+  "GR",
+  "HU",
+  "IS",
+  "IE",
+  "IT",
+  "XK",
+  "LV",
+  "LI",
+  "LT",
+  "LU",
+  "MT",
+  "MD",
+  "MC",
+  "ME",
+  "NL",
+  "MK",
+  "NO",
+  "PL",
+  "PT",
+  "RO",
+  "RU",
+  "SM",
+  "RS",
+  "SK",
+  "SI",
+  "ES",
+  "SE",
+  "CH",
+  "TR",
+  "UA",
+  "VA",
+];
+const ALLOWED_COUNTRY_CODES = new Set([
+  "BD",
+  "IN",
+  "PK",
+  "US",
+  "UK",
+  "AU",
+  ...EUROPE_COUNTRY_CODES,
+]);
 
-export const dynamic = "force-dynamic";
-
-let cachedPayload: unknown = null;
-let cachedAt = 0;
+export const dynamic = "force-static";
+export const revalidate = 1800;
+export const maxDuration = 60;
 
 const fetchJson = async <T,>(path: string): Promise<T> => {
   const response = await fetch(`${API_ROOT}/${path}`, {
-    cache: "no-store",
+    next: {
+      revalidate: REVALIDATE_SECONDS,
+      tags: ["iptv-directory"],
+    },
   });
 
   if (!response.ok) {
@@ -114,133 +168,8 @@ const channelRankScore = (channel: Channel, streams: Stream[], logo?: string) =>
   return score;
 };
 
-const curateCountryEntries = (entries: ChannelEntry[]) => {
-  const byCountry = new Map<string, ChannelEntry[]>();
-
-  for (const entry of entries) {
-    const countryEntries = byCountry.get(entry.countryCode) ?? [];
-    countryEntries.push(entry);
-    byCountry.set(entry.countryCode, countryEntries);
-  }
-
-  const curated: ChannelEntry[] = [];
-
-  for (const countryEntries of byCountry.values()) {
-    const sportsEntries = countryEntries.filter((entry) => entry.isSports);
-    const featuredEntries = countryEntries
-      .filter((entry) => !entry.isSports)
-      .sort((a, b) => b.rankScore - a.rankScore || a.name.localeCompare(b.name))
-      .slice(0, FEATURED_PER_COUNTRY);
-
-    curated.push(...sportsEntries, ...featuredEntries);
-  }
-
-  return curated.sort((a, b) => {
-    const countrySort = a.countryName.localeCompare(b.countryName);
-    if (countrySort) return countrySort;
-    if (a.isSports !== b.isSports) return a.isSports ? -1 : 1;
-    return b.rankScore - a.rankScore || a.name.localeCompare(b.name);
-  });
-};
-
-const fetchWithTimeout = async (url: string, init: RequestInit = {}) => {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), STREAM_CHECK_TIMEOUT_MS);
-  const headers = new Headers(init.headers);
-  headers.set("User-Agent", "Mozilla/5.0 Public IPTV Explorer");
-
-  try {
-    return await fetch(url, {
-      ...init,
-      signal: controller.signal,
-      redirect: "follow",
-      headers,
-    });
-  } finally {
-    clearTimeout(timeoutId);
-  }
-};
-
-const isManifestLike = (text: string, url: string) =>
-  url.includes(".m3u8") ? text.includes("#EXTM3U") : text.length > 0;
-
-const checkStream = async (stream: Stream) => {
-  if (hasGeoWarning(stream)) return false;
-
-  try {
-    const response = await fetchWithTimeout(stream.url, {
-      headers: {
-        ...(stream.referrer ? { Referer: stream.referrer } : {}),
-        Range: "bytes=0-4095",
-      },
-    });
-
-    if (!response.ok) return false;
-
-    const reader = response.body?.getReader();
-    if (!reader) return false;
-
-    const { value } = await reader.read();
-    await reader.cancel();
-
-    if (!value) return false;
-
-    const text = new TextDecoder().decode(value);
-    return isManifestLike(text, stream.url);
-  } catch {
-    return false;
-  }
-};
-
-const verifiedStreams = async (streams: Stream[]) => {
-  const sortedStreams = sortStreams(streams).slice(0, STREAMS_TO_CHECK_PER_CHANNEL);
-  const checks = await Promise.all(
-    sortedStreams.map(async (stream) => ({
-      stream,
-      ok: await checkStream(stream),
-    })),
-  );
-
-  return checks.filter((check) => check.ok).map((check) => check.stream);
-};
-
-const verifyIndianSportsEntries = async (entries: ChannelEntry[]) => {
-  const verifiedEntries = [...entries];
-  const targetIndexes = verifiedEntries
-    .map((entry, index) => ({ entry, index }))
-    .filter(({ entry }) => entry.countryCode === VERIFIED_COUNTRY && entry.isSports);
-
-  for (let index = 0; index < targetIndexes.length; index += STREAM_CHECK_BATCH_SIZE) {
-    const batch = targetIndexes.slice(index, index + STREAM_CHECK_BATCH_SIZE);
-    const checkedBatch = await Promise.all(
-      batch.map(async ({ entry, index: entryIndex }) => ({
-        entryIndex,
-        streams: await verifiedStreams(entry.streams),
-      })),
-    );
-
-    for (const checked of checkedBatch) {
-      verifiedEntries[checked.entryIndex] = {
-        ...verifiedEntries[checked.entryIndex],
-        streams: checked.streams,
-        verified: checked.streams.length > 0,
-      };
-    }
-  }
-
-  return verifiedEntries;
-};
-
 export async function GET() {
   try {
-    if (cachedPayload && Date.now() - cachedAt < CACHE_MS) {
-      return NextResponse.json(cachedPayload, {
-        headers: {
-          "Cache-Control": "public, max-age=300",
-        },
-      });
-    }
-
     const [countries, channels, streams, logos, categories, blocklist] =
       await Promise.all([
         fetchJson<Country[]>("countries.json"),
@@ -272,7 +201,12 @@ export async function GET() {
     const allEntries: ChannelEntry[] = [];
 
     for (const channel of channels) {
-      if (!channel.country || channel.is_nsfw || blockedChannels.has(channel.id)) {
+      if (
+        !channel.country ||
+        !ALLOWED_COUNTRY_CODES.has(channel.country) ||
+        channel.is_nsfw ||
+        blockedChannels.has(channel.id)
+      ) {
         continue;
       }
 
@@ -299,24 +233,25 @@ export async function GET() {
       });
     }
 
-    const curatedEntries = curateCountryEntries(allEntries);
-    const entries = await verifyIndianSportsEntries(curatedEntries);
+    const entries = allEntries.sort((a, b) => {
+      const countrySort = a.countryName.localeCompare(b.countryName);
+      if (countrySort) return countrySort;
+      if (a.isSports !== b.isSports) return a.isSports ? -1 : 1;
+      return b.rankScore - a.rankScore || a.name.localeCompare(b.name);
+    });
 
     const payload = {
       entries: entries.filter((entry) => entry.streams.length > 0),
       categories: categories.sort((a, b) => a.name.localeCompare(b.name)),
       meta: {
-        featuredPerCountry: FEATURED_PER_COUNTRY,
-        verifiedCountry: VERIFIED_COUNTRY,
+        countryCodes: Array.from(ALLOWED_COUNTRY_CODES).sort(),
+        europeCountryCodes: EUROPE_COUNTRY_CODES,
       },
     };
 
-    cachedPayload = payload;
-    cachedAt = Date.now();
-
     return NextResponse.json(payload, {
       headers: {
-        "Cache-Control": "public, max-age=300",
+        "Cache-Control": "public, s-maxage=1800, stale-while-revalidate=3600",
       },
     });
   } catch (error) {
