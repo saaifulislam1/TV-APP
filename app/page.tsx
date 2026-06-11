@@ -41,13 +41,20 @@ type ChannelsPayload = {
   };
 };
 
+type ActiveUsersPayload = {
+  activeUsers: number;
+};
+
 type PlaybackStatus = "idle" | "loading" | "ready" | "unavailable";
 
 type HlsInstance = {
   loadSource: (source: string) => void;
   attachMedia: (media: HTMLVideoElement) => void;
   destroy: () => void;
-  on: (event: string, callback: (_event: string, data: { fatal?: boolean }) => void) => void;
+  on: (
+    event: string,
+    callback: (_event: string, data: { fatal?: boolean }) => void,
+  ) => void;
 };
 
 type HlsConstructor = {
@@ -64,12 +71,14 @@ declare global {
 
 const HLS_SCRIPT = "https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js";
 const FAVOURITES_STORAGE_KEY = "tv-app:favourite-channel-ids";
+const ACTIVE_SESSION_STORAGE_KEY = "tv-app:active-session-id";
 const ALL_COUNTRIES = "ALL";
 const EUROPE_COUNTRIES = "EUROPE";
 const ALL_GROUPS = "ALL";
 const ALL_CATEGORIES = "ALL";
 const DEFAULT_COUNTRY = "BD";
 const PAGE_SIZE = 72;
+const ACTIVE_USERS_REFRESH_MS = 20_000;
 const CHANNEL_GROUPS = [
   { id: ALL_GROUPS, label: "All" },
   { id: "FAVOURITES", label: "Favourites" },
@@ -164,6 +173,14 @@ const loadHls = () =>
     document.head.appendChild(script);
   });
 
+const createSessionId = () => {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+};
+
 const normalizeCategory = (category: string) =>
   category
     .split("_")
@@ -193,7 +210,9 @@ const streamRank = (stream: Stream, failedUrls: Set<string>) => {
 };
 
 const sortStreams = (streams: Stream[], failedUrls: Set<string>) =>
-  [...streams].sort((a, b) => streamRank(a, failedUrls) - streamRank(b, failedUrls));
+  [...streams].sort(
+    (a, b) => streamRank(a, failedUrls) - streamRank(b, failedUrls),
+  );
 
 const isEuropeCountry = (countryCode: string) =>
   EUROPE_COUNTRY_CODES.includes(countryCode);
@@ -211,6 +230,7 @@ const isEntryInGroup = (
 
 export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const playerShellRef = useRef<HTMLElement>(null);
   const hlsRef = useRef<HlsInstance | null>(null);
   const [entries, setEntries] = useState<ChannelEntry[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
@@ -221,9 +241,17 @@ export default function Home() {
   const deferredQuery = useDeferredValue(query);
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null);
-  const [selectedStreamUrl, setSelectedStreamUrl] = useState<string | null>(null);
+  const [selectedStreamUrl, setSelectedStreamUrl] = useState<string | null>(
+    null,
+  );
   const [failedUrls, setFailedUrls] = useState<Set<string>>(new Set());
   const [playbackStatus, setPlaybackStatus] = useState<PlaybackStatus>("idle");
+  const [activeUsers, setActiveUsers] = useState(0);
+  const [isPaused, setIsPaused] = useState(true);
+  const [isMuted, setIsMuted] = useState(true);
+  const [volume, setVolume] = useState(0.8);
+  const [canSeek, setCanSeek] = useState(false);
+  const [streamReloadKey, setStreamReloadKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [favouriteChannelIds, setFavouriteChannelIds] = useState<Set<string>>(
@@ -265,12 +293,17 @@ export default function Home() {
         setEntries(nextEntries);
         setCategories(payload.categories);
         setSelectedEntryId(
-          nextEntries.find((entry) => entry.countryCode === DEFAULT_COUNTRY)?.id ??
+          nextEntries.find((entry) => entry.countryCode === DEFAULT_COUNTRY)
+            ?.id ??
             nextEntries[0]?.id ??
             null,
         );
       } catch (nextError) {
-        setError(nextError instanceof Error ? nextError.message : "Could not load IPTV data");
+        setError(
+          nextError instanceof Error
+            ? nextError.message
+            : "Could not load IPTV data",
+        );
       } finally {
         if (isMounted) {
           setIsLoading(false);
@@ -290,6 +323,41 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    let sessionId = window.sessionStorage.getItem(ACTIVE_SESSION_STORAGE_KEY);
+
+    if (!sessionId) {
+      sessionId = createSessionId();
+      window.sessionStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, sessionId);
+    }
+
+    const pingActiveUsers = async (action: "heartbeat" | "leave") => {
+      const response = await fetch("/api/active-users", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ sessionId, action }),
+        cache: "no-store",
+      });
+
+      if (!response.ok) return;
+
+      const payload = (await response.json()) as ActiveUsersPayload;
+      setActiveUsers(payload.activeUsers);
+    };
+
+    void pingActiveUsers("heartbeat").catch(() => undefined);
+    const intervalId = window.setInterval(() => {
+      void pingActiveUsers("heartbeat").catch(() => undefined);
+    }, ACTIVE_USERS_REFRESH_MS);
+
+    return () => {
+      window.clearInterval(intervalId);
+      void pingActiveUsers("leave").catch(() => undefined);
+    };
+  }, []);
+
+  useEffect(() => {
     window.localStorage.setItem(
       FAVOURITES_STORAGE_KEY,
       JSON.stringify(Array.from(favouriteChannelIds)),
@@ -297,10 +365,14 @@ export default function Home() {
   }, [favouriteChannelIds]);
 
   const countryOptions = useMemo(() => {
-    const countryCounts = new Map<string, { name: string; flag: string; count: number }>();
+    const countryCounts = new Map<
+      string,
+      { name: string; flag: string; count: number }
+    >();
 
     for (const entry of entries) {
-      if (!entry.streams.some((stream) => !failedUrls.has(stream.url))) continue;
+      if (!entry.streams.some((stream) => !failedUrls.has(stream.url)))
+        continue;
 
       const country = countryCounts.get(entry.countryCode) ?? {
         name: entry.countryName,
@@ -331,17 +403,27 @@ export default function Home() {
   };
 
   const filteredEntries = useMemo(() => {
-    const queryTokens = normalizeSearchText(deferredQuery).split(" ").filter(Boolean);
+    const queryTokens = normalizeSearchText(deferredQuery)
+      .split(" ")
+      .filter(Boolean);
 
     return entries.filter((entry) => {
-      const hasWorkingCandidate = entry.streams.some((stream) => !failedUrls.has(stream.url));
+      const hasWorkingCandidate = entry.streams.some(
+        (stream) => !failedUrls.has(stream.url),
+      );
       const matchesCountry =
         selectedCountry === ALL_COUNTRIES ||
-        (selectedCountry === EUROPE_COUNTRIES && isEuropeCountry(entry.countryCode)) ||
+        (selectedCountry === EUROPE_COUNTRIES &&
+          isEuropeCountry(entry.countryCode)) ||
         entry.countryCode === selectedCountry;
-      const matchesGroup = isEntryInGroup(entry, selectedGroup, favouriteChannelIds);
+      const matchesGroup = isEntryInGroup(
+        entry,
+        selectedGroup,
+        favouriteChannelIds,
+      );
       const matchesCategory =
-        selectedCategory === ALL_CATEGORIES || entry.categories.includes(selectedCategory);
+        selectedCategory === ALL_CATEGORIES ||
+        entry.categories.includes(selectedCategory);
       const searchableText = normalizeSearchText(
         [
           entry.id,
@@ -381,7 +463,9 @@ export default function Home() {
   );
 
   const selectedEntry = useMemo(
-    () => filteredEntries.find((entry) => entry.id === selectedEntryId) ?? filteredEntries[0],
+    () =>
+      filteredEntries.find((entry) => entry.id === selectedEntryId) ??
+      filteredEntries[0],
     [filteredEntries, selectedEntryId],
   );
 
@@ -394,7 +478,8 @@ export default function Home() {
   );
 
   const selectedStream =
-    playableStreams.find((stream) => stream.url === selectedStreamUrl) ?? playableStreams[0];
+    playableStreams.find((stream) => stream.url === selectedStreamUrl) ??
+    playableStreams[0];
 
   useEffect(() => {
     if (!selectedEntry) {
@@ -420,7 +505,9 @@ export default function Home() {
 
     const markUnavailable = () => {
       setFailedUrls((current) => new Set(current).add(stream.url));
-      const nextStream = playableStreams.find((candidate) => candidate.url !== stream.url);
+      const nextStream = playableStreams.find(
+        (candidate) => candidate.url !== stream.url,
+      );
 
       if (nextStream) {
         setSelectedStreamUrl(nextStream.url);
@@ -478,7 +565,42 @@ export default function Home() {
       video.removeEventListener("canplay", handleReady);
       video.removeEventListener("error", handleError);
     };
-  }, [playableStreams, selectedEntry, selectedStream]);
+  }, [playableStreams, selectedEntry, selectedStream, streamReloadKey]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    video.muted = isMuted;
+    video.volume = volume;
+  }, [isMuted, selectedStream, volume]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    const syncPlaybackState = () => {
+      setIsPaused(video.paused);
+      setIsMuted(video.muted);
+      setVolume(video.volume);
+      setCanSeek(Number.isFinite(video.duration) && video.duration > 0);
+    };
+
+    video.addEventListener("play", syncPlaybackState);
+    video.addEventListener("pause", syncPlaybackState);
+    video.addEventListener("volumechange", syncPlaybackState);
+    video.addEventListener("loadedmetadata", syncPlaybackState);
+    video.addEventListener("durationchange", syncPlaybackState);
+    syncPlaybackState();
+
+    return () => {
+      video.removeEventListener("play", syncPlaybackState);
+      video.removeEventListener("pause", syncPlaybackState);
+      video.removeEventListener("volumechange", syncPlaybackState);
+      video.removeEventListener("loadedmetadata", syncPlaybackState);
+      video.removeEventListener("durationchange", syncPlaybackState);
+    };
+  }, [selectedStream]);
 
   useEffect(() => {
     return () => {
@@ -497,6 +619,60 @@ export default function Home() {
   const selectedIsFavourite = selectedEntry
     ? favouriteChannelIds.has(selectedEntry.id)
     : false;
+  const hasPlayableStream = Boolean(selectedStream);
+
+  const togglePlayback = () => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (video.paused) {
+      void video.play().catch(() => undefined);
+    } else {
+      video.pause();
+    }
+  };
+
+  const seekBy = (seconds: number) => {
+    const video = videoRef.current;
+    if (!video || !Number.isFinite(video.duration)) return;
+
+    video.currentTime = Math.min(
+      Math.max(video.currentTime + seconds, 0),
+      video.duration,
+    );
+  };
+
+  const reloadCurrentStream = () => {
+    setStreamReloadKey((key) => key + 1);
+  };
+
+  const toggleMute = () => {
+    setIsMuted((muted) => !muted);
+  };
+
+  const openPictureInPicture = async () => {
+    const video = videoRef.current;
+    if (!video || !document.pictureInPictureEnabled) return;
+
+    if (document.pictureInPictureElement) {
+      await document.exitPictureInPicture().catch(() => undefined);
+      return;
+    }
+
+    await video.requestPictureInPicture().catch(() => undefined);
+  };
+
+  const toggleFullscreen = async () => {
+    const playerShell = playerShellRef.current;
+    if (!playerShell) return;
+
+    if (document.fullscreenElement) {
+      await document.exitFullscreen().catch(() => undefined);
+      return;
+    }
+
+    await playerShell.requestFullscreen().catch(() => undefined);
+  };
 
   return (
     <main className="min-h-screen overflow-x-hidden bg-[#07090d] text-[#eef2ff]">
@@ -512,13 +688,15 @@ export default function Home() {
                 Modern TV browser
               </h1>
               <p className="mt-2 max-w-2xl text-sm text-[#93a2b7]">
-                Bangladesh, India, Pakistan, USA, UK, Australia, and European countries.
-                Star any channel to keep it in your personal Favourites list.
+                Bangladesh, India, Pakistan, USA, UK, Australia, and European
+                countries. Star any channel to keep it in your personal
+                Favourites list.
               </p>
             </div>
 
-            <div className="grid grid-cols-3 gap-2 text-sm">
+            <div className="grid grid-cols-2 gap-2 text-sm sm:grid-cols-4">
               {[
+                ["Active users", activeUsers],
                 ["Channels", availableCount],
                 ["Countries", countryCount],
                 ["Saved", savedFavouriteCount],
@@ -634,7 +812,9 @@ export default function Home() {
             <p className="text-sm font-semibold text-white">
               {filteredEntries.length.toLocaleString()} channels
             </p>
-            <p className="text-xs text-[#7f8ea3]">rendering {visibleEntries.length}</p>
+            <p className="text-xs text-[#7f8ea3]">
+              rendering {visibleEntries.length}
+            </p>
           </div>
 
           <div className="h-[55vh] min-h-[390px] overflow-y-auto">
@@ -767,7 +947,10 @@ export default function Home() {
           </div>
         </aside>
 
-        <section className="smooth-panel sticky top-3 z-10 order-1 overflow-hidden rounded-lg border border-white/10 bg-[#10141c]/92 shadow-[0_28px_80px_rgba(0,0,0,0.38)] backdrop-blur lg:static lg:order-2">
+        <section
+          ref={playerShellRef}
+          className="smooth-panel sticky top-3 z-10 order-1 overflow-hidden rounded-lg border border-white/10 bg-[#10141c]/92 shadow-[0_28px_80px_rgba(0,0,0,0.38)] backdrop-blur lg:static lg:order-2"
+        >
           <div className="relative aspect-video bg-black">
             {isLoading ? (
               <PlayerSkeleton />
@@ -777,7 +960,7 @@ export default function Home() {
                 className="h-full w-full bg-black"
                 autoPlay
                 controls
-                muted
+                muted={isMuted}
                 playsInline
                 poster={selectedEntry?.logo}
               />
@@ -797,6 +980,77 @@ export default function Home() {
                 </span>
               </div>
             )}
+          </div>
+
+          <div className="flex flex-col gap-3 border-t border-white/10 bg-[#0c1118] px-4 py-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <PlayerControlButton
+                label="Back 10 seconds"
+                disabled={!hasPlayableStream || !canSeek}
+                onClick={() => seekBy(-10)}
+              >
+                -10
+              </PlayerControlButton>
+              <PlayerControlButton
+                label={isPaused ? "Play" : "Pause"}
+                disabled={!hasPlayableStream}
+                onClick={togglePlayback}
+              >
+                {isPaused ? "▶" : "❚❚"}
+              </PlayerControlButton>
+              <PlayerControlButton
+                label="Forward 10 seconds"
+                disabled={!hasPlayableStream || !canSeek}
+                onClick={() => seekBy(10)}
+              >
+                +10
+              </PlayerControlButton>
+              <PlayerControlButton
+                label={isMuted ? "Unmute" : "Mute"}
+                disabled={!hasPlayableStream}
+                onClick={toggleMute}
+              >
+                {isMuted ? "🔇" : "🔊"}
+              </PlayerControlButton>
+              <label className="flex min-w-[150px] flex-1 items-center gap-2 text-xs font-medium text-[#9aa7bd] sm:max-w-[230px]">
+                Volume
+                <input
+                  className="h-2 min-w-0 flex-1 accent-[#6ee7b7]"
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  value={volume}
+                  disabled={!hasPlayableStream}
+                  onChange={(event) => {
+                    const nextVolume = Number(event.target.value);
+                    setVolume(nextVolume);
+                    setIsMuted(nextVolume === 0);
+                  }}
+                />
+              </label>
+              <PlayerControlButton
+                label="Reload stream"
+                disabled={!hasPlayableStream}
+                onClick={reloadCurrentStream}
+              >
+                ↻
+              </PlayerControlButton>
+              <PlayerControlButton
+                label="Picture in picture"
+                disabled={!hasPlayableStream}
+                onClick={() => void openPictureInPicture()}
+              >
+                PiP
+              </PlayerControlButton>
+              <PlayerControlButton
+                label="Fullscreen"
+                disabled={!hasPlayableStream}
+                onClick={() => void toggleFullscreen()}
+              >
+                ⛶
+              </PlayerControlButton>
+            </div>
           </div>
 
           <div className="grid gap-4 border-t border-white/10 bg-[#111821] p-4 lg:grid-cols-[1fr_290px]">
@@ -862,7 +1116,9 @@ export default function Home() {
 
             <div className="rounded-md border border-white/10 bg-[#151b25] p-3">
               <div className="flex items-center justify-between gap-3">
-                <p className="text-sm font-semibold text-white">Stream status</p>
+                <p className="text-sm font-semibold text-white">
+                  Stream status
+                </p>
                 <span
                   className={`rounded-sm px-2 py-1 text-xs font-semibold ${
                     playbackStatus === "ready"
@@ -884,10 +1140,13 @@ export default function Home() {
                   disabled={!playableStreams.length}
                   onChange={(event) => setSelectedStreamUrl(event.target.value)}
                 >
-                  {!playableStreams.length && <option>No public streams</option>}
+                  {!playableStreams.length && (
+                    <option>No public streams</option>
+                  )}
                   {playableStreams.map((stream, index) => (
                     <option key={`${stream.url}-${index}`} value={stream.url}>
-                      {stream.quality ?? "Auto"} {stream.label ? `- ${stream.label}` : ""}
+                      {stream.quality ?? "Auto"}{" "}
+                      {stream.label ? `- ${stream.label}` : ""}
                     </option>
                   ))}
                 </select>
@@ -899,8 +1158,12 @@ export default function Home() {
                     {selectedStream.label}
                   </p>
                 )}
-                {selectedStream?.referrer && <p>May require a referrer header.</p>}
-                {selectedStream?.user_agent && <p>May require a custom user-agent.</p>}
+                {selectedStream?.referrer && (
+                  <p>May require a referrer header.</p>
+                )}
+                {selectedStream?.user_agent && (
+                  <p>May require a custom user-agent.</p>
+                )}
                 {selectedEntry?.website && (
                   <a
                     className="inline-flex font-medium text-[#5eead4] hover:text-[#99f6e4]"
@@ -918,7 +1181,7 @@ export default function Home() {
       </section>
 
       <footer className="mx-auto w-full max-w-[1500px] px-4 pb-6 pt-2 text-center text-xs font-medium text-[#7f8ea3] sm:px-6 lg:px-8">
-        Developed by Saiful Islam
+        Developed by Saiful Islam Rifat
       </footer>
     </main>
   );
@@ -968,6 +1231,31 @@ function GroupButton({
       onClick={onClick}
     >
       {label}
+    </button>
+  );
+}
+
+function PlayerControlButton({
+  children,
+  disabled,
+  label,
+  onClick,
+}: {
+  children: React.ReactNode;
+  disabled?: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      aria-label={label}
+      className="flex h-9 min-w-9 items-center justify-center rounded-md border border-white/10 bg-white/[0.06] px-2 text-sm font-semibold text-white transition duration-200 hover:border-[#6ee7b7]/35 hover:bg-white/[0.1] disabled:opacity-45 disabled:hover:border-white/10 disabled:hover:bg-white/[0.06]"
+      disabled={disabled}
+      title={label}
+      type="button"
+      onClick={onClick}
+    >
+      {children}
     </button>
   );
 }
